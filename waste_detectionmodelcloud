@@ -1,0 +1,176 @@
+import cv2
+import json
+import time
+import io
+from PIL import Image
+from google import genai
+from google.genai import types
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+GEMINI_API_KEY = "AQ.Ab8RN6LImo3tid7N_iov1ad__FkUW5_g4x737tZc48xZ-2kguQ"
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+SYSTEM_PROMPT = """
+You are an expert waste segregation AI. Analyze the waste item placed in the center of the camera.
+Classify it strictly into ONE of three categories:
+
+1. "WET" -> Organic food scraps, vegetable/fruit peels, tea bags, leftover food, leaves, wet biological waste.
+2. "DRY" -> CLEAN plastic bottles/containers, clean cardboard, clean dry paper, aluminum cans, metal tins.
+3. "REJECT" -> Soiled/greasy paper or boxes (like oily pizza boxes), multilayer chip wrappers (foil-plastic), dirty wrappers, broken electronic parts, styrofoam, rubber, black plastic, medical/hygiene waste.
+
+Output ONLY a JSON object matching this exact schema:
+{
+  "item_name": "<concise item name>",
+  "category": "WET" | "DRY" | "REJECT",
+  "reason": "<short 1-sentence reason>"
+}
+"""
+
+# ==========================================
+# 2. CLASSIFICATION FUNCTION
+# ==========================================
+def classify_frame(frame):
+    """Sends cropped frame to Gemini 3.6 Flash."""
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb_frame)
+
+    img_byte_arr = io.BytesIO()
+    pil_img.save(img_byte_arr, format='JPEG')
+    img_bytes = img_byte_arr.getvalue()
+
+    start_t = time.time()
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=[
+            types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+            SYSTEM_PROMPT
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json"
+        )
+    )
+    latency = round((time.time() - start_t) * 1000)
+
+    raw_text = response.text.strip()
+    if raw_text.startswith("```json"):
+        raw_text = raw_text[7:]
+    if raw_text.startswith("```"):
+        raw_text = raw_text[3:]
+    if raw_text.endswith("```"):
+        raw_text = raw_text[:-3]
+    raw_text = raw_text.strip()
+
+    data = json.loads(raw_text)
+    return {
+        "item": data.get("item_name", "Unknown Object"),
+        "category": data.get("category", "REJECT").upper(),
+        "reason": data.get("reason", ""),
+        "latency": latency
+    }
+
+# ==========================================
+# 3. WEBCAM INTERFACE & HUD
+# ==========================================
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] Cannot access webcam.")
+        return
+
+    COLOR_WET = (74, 222, 128)     # Green
+    COLOR_DRY = (246, 182, 41)     # Blue
+    COLOR_REJECT = (82, 82, 255)   # Red
+    COLOR_IDLE = (200, 200, 200)   # Light Gray
+
+    last_result = None
+    status_text = "Press SPACE to Classify"
+    status_color = COLOR_IDLE
+
+    print("\n--- Live Waste Segregation Camera Active ---")
+    print(" [SPACE] : Scan & Classify current item")
+    print(" [C]     : Reset current result")
+    print(" [Q]     : Quit")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
+
+        box_size = 280
+        x1 = (w - box_size) // 2
+        y1 = (h - box_size) // 2
+        x2 = x1 + box_size
+        y2 = y1 + box_size
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), status_color, 2)
+        cv2.putText(frame, "PLACE ITEM HERE", (x1 + 35, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2)
+
+        cv2.rectangle(frame, (0, 0), (w, 80), (20, 24, 30), -1)
+        cv2.line(frame, (0, 80), (w, 80), (60, 70, 85), 2)
+
+        if last_result:
+            cat = last_result["category"]
+            cat_color = COLOR_WET if cat == "WET" else COLOR_DRY if cat == "DRY" else COLOR_REJECT
+
+            cv2.putText(frame, f"ITEM: {last_result['item']}", (20, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame, f"[{cat}] ({last_result['latency']}ms)", (20, 62),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, cat_color, 2)
+
+            cv2.rectangle(frame, (0, h - 45), (w, h), (15, 18, 22), -1)
+            cv2.putText(frame, f"Reason: {last_result['reason']}", (20, h - 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 210, 220), 1)
+        else:
+            cv2.putText(frame, status_text, (20, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, status_color, 2)
+
+        cv2.putText(frame, "[SPACE]: Scan  |  [C]: Reset  |  [Q]: Quit",
+                    (w - 380, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
+
+        cv2.imshow("SmartSort AI - VLM Detector", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q') or key == 27:
+            break
+        elif key == ord('c'):
+            last_result = None
+            status_text = "Press SPACE to Classify"
+            status_color = COLOR_IDLE
+        elif key == 32:  # SPACE
+            status_text = "Analyzing with Gemini 3.6 Flash..."
+            status_color = (0, 215, 255)
+            
+            temp_frame = frame.copy()
+            cv2.rectangle(temp_frame, (0, 0), (w, 80), (20, 24, 30), -1)
+            cv2.putText(temp_frame, status_text, (20, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, status_color, 2)
+            cv2.imshow("SmartSort AI - VLM Detector", temp_frame)
+            cv2.waitKey(1)
+
+            crop = frame[y1:y2, x1:x2]
+            try:
+                last_result = classify_frame(crop)
+                cat = last_result["category"]
+                status_color = COLOR_WET if cat == "WET" else COLOR_DRY if cat == "DRY" else COLOR_REJECT
+                print(f"\n[DETECTED] {last_result['item']} -> {cat} ({last_result['latency']}ms)")
+                print(f"Reason: {last_result['reason']}")
+            except Exception as e:
+                print(f"[ERROR] API Call Failed: {e}")
+                status_text = "Classification failed. Check terminal error."
+                status_color = COLOR_REJECT
+                last_result = None
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
